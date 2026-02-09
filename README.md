@@ -4,7 +4,7 @@
 
 > [**Try it live**](https://thinky3d.vercel.app/)
 
-Thinky3D turns any topic — or any PDF — into a full interactive course with rich slides, live 3D simulations, an in-context chatbot, and adaptive quizzes. All generated on-the-fly by Google Gemini.
+Thinky3D turns any topic or any PDF into a full interactive course with rich slides, live 3D simulations, an in-context chatbot, and adaptive quizzes. All generated on-the-fly by Google Gemini.
 
 ---
 
@@ -12,7 +12,7 @@ Thinky3D turns any topic — or any PDF — into a full interactive course with 
 
 | Feature | Description |
 |---|---|
-| **AI Course Generation** | Type a topic or drop a PDF — Gemini builds a structured, multi-chapter syllabus instantly. |
+| **AI Course Generation** | Type a topic or drop a PDF Gemini builds a structured, multi-chapter syllabus instantly. |
 | **Rich Slide Decks** | Beautifully themed HTML slides with LaTeX math support (MathJax), gradient backgrounds, and smooth transitions. |
 | **Live 3D Simulations** | Every chapter gets a unique, interactive React Three Fiber scene with adjustable parameters — generated entirely by AI. |
 | **AI Chatbot** | Ask follow-up questions about any slide and get answers grounded in the course content. |
@@ -27,13 +27,13 @@ Thinky3D turns any topic — or any PDF — into a full interactive course with 
 
 ## Tech Stack
 
-- **Frontend** — React 19, TypeScript, Vite
-- **3D** — Three.js, React Three Fiber, Drei
-- **AI** — Google Gemini 3.0 Flash (slides, quizzes, chat) + Gemini 3.0 Pro (3D simulation code)
-- **Math** — MathJax 3
-- **PDF** — PDF.js
-- **Styling** — Tailwind CSS, Clash Display + Satoshi fonts
-- **Deployment** — Vercel
+- **Frontend** React 19, TypeScript, Vite
+- **3D** Three.js, React Three Fiber, Drei
+- **AI** Google Gemini 3.0 Flash (slides, quizzes, chat) + Gemini 3.0 Pro (3D simulation code)
+- **Math** MathJax 3
+- **PDF** PDF.js
+- **Styling** Tailwind CSS, Clash Display + Satoshi fonts
+- **Deployment** Vercel
 
 ---
 
@@ -82,10 +82,10 @@ Topic / PDF  ──>  Gemini generates syllabus
       with LaTeX    R3F Scene     Questions
 ```
 
-1. **Syllabus** — Gemini analyzes the topic and outputs a chapter list with descriptions.
-2. **Slides** — Each chapter's slides are generated as styled HTML with math, diagrams, and examples.
-3. **3D Simulation** — Gemini Pro writes a self-contained React Three Fiber component with controllable parameters.
-4. **Quiz** — Multiple-choice questions are generated to reinforce learning.
+1. **Syllabus** Gemini analyzes the topic and outputs a chapter list with descriptions.
+2. **Slides** Each chapter's slides are generated as styled HTML with math, diagrams, and examples.
+3. **3D Simulation** Gemini Pro writes a self-contained React Three Fiber component with controllable parameters.
+4. **Quiz** Multiple-choice questions are generated to reinforce learning.
 
 Sections prefetch in the background so users can start learning immediately while later chapters generate.
 
