@@ -119,6 +119,4 @@ thinky3d/
 
 ---
 
-## License
-
-Built for the Google Gemini API Developer Competition.
+ 
