@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Thinky3D - Learn Anything with AI</title>
+    <!-- Distinctive typography: Clash Display for headings, Satoshi for body -->
+    <link href="https://api.fontshare.com/v2/css?f[]=clash-display@200,300,400,500,600,700&f[]=satoshi@300,400,500,700,900&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [['$', '$'], ['\\(', '\\)']],
+          displayMath: [['$$', '$$'], ['\\[', '\\]']],
+          processEscapes: true,
+          processEnvironments: true,
+          // Common macros
+          macros: {
+            RR: '\\mathbb{R}',
+            NN: '\\mathbb{N}',
+            ZZ: '\\mathbb{Z}'
+          },
+          // Tags for equation numbering
+          tags: 'ams'
+        },
+        options: {
+          skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
+          ignoreHtmlClass: 'no-mathjax',
+          processHtmlClass: 'mathjax-process',
+          // Enable rendering in dynamic content
+          renderActions: {
+            addMenu: [],
+            checkLoading: []
+          }
+        },
+        startup: {
+          pageReady: () => {
+            console.log('MathJax is ready');
+            return MathJax.startup.defaultPageReady();
+          }
+        },
+        chtml: {
+          scale: 1,
+          minScale: 0.5,
+          matchFontHeight: true,
+          displayAlign: 'center',
+          displayIndent: '0'
+        },
+        loader: {
+          load: ['[tex]/ams', '[tex]/newcommand', '[tex]/physics']
+        }
+      };
+    </script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml-full.js"></script>
+  <link rel="stylesheet" href="/index.css">
+</head>
+  <body>
+    <div id="root"></div>
+  <script type="module" src="/index.tsx"></script>
+</body>
+</html>
