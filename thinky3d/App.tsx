@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Analytics } from '@vercel/analytics/react';
 import { AppState, Course, Section, SectionContent, Slide, LearningLevel, LEARNING_LEVELS, InteractiveConfig } from './types';
 import * as Gemini from './services/geminiService';
 import { GenerationStep, buildSyllabusContext, getProviderDisplayName } from './services/geminiService';
@@ -10,6 +11,8 @@ import { QuizModule } from './components/QuizModule';
 import { extractTextFromPdf } from './services/pdfParser';
 import { Search, Lock, CheckCircle, PlayCircle, Loader2, ArrowLeft, CloudLightning, Sparkles, Download, BookOpen, Box, HelpCircle, Check, Maximize, Minimize, X, FileText, Upload, Mic, Volume2, VolumeX, MonitorPlay, MessageCircle } from 'lucide-react';
 import { SlideChatbot } from './components/SlideChatbot';
+import { SimulationEditBar } from './components/SimulationEditBar';
+import { SimEditHistoryItem } from './types';
 import { devLogger } from './services/devLogger';
 
 // Generation progress state type
@@ -22,24 +25,36 @@ interface GenerationProgress {
 }
 
 const RANDOM_TOPICS = [
-  "How Volcanoes Erupt",
-  "How Plants Make Food",
-  "The Water Cycle",
-  "How Magnets Work",
+  "DNA Double Helix Structure",
+  "Black Holes and Event Horizons",
+  "Simple Pendulum Motion",
+  "Breadth-First Search (BFS)",
+  "Depth-First Search (DFS)",
+  "Binary Search Trees",
+  "Pathfinding Algorithms",
+  "Atomic Structure and Electron Shells",
+  "Möbius Strip Topology",
+  "Pythagorean Theorem",
+  "Derivatives in Calculus",
+  "Integration and Area Under Curves",
   "The Solar System",
-  "How Rainbows Form",
-  "How Sound Travels",
-  "What Causes Earthquakes",
-  "How the Human Heart Works",
-  "Why Seasons Change",
-  "How Batteries Work",
-  "The Food Chain",
-  "How Airplanes Fly",
-  "States of Matter",
-  "How Light and Shadows Work",
-  "Why the Moon Changes Shape",
-  "How Mountains Form",
-  "What Makes Things Float or Sink",
+  "How Sound Waves Travel",
+  "Magnetic Field Lines",
+  "States of Matter and Phase Transitions",
+  "Wave Interference Patterns",
+  "Doppler Effect",
+  "Fourier Transform Visualization",
+  "Graph Theory Basics",
+  "Sorting Algorithms (Bubble, Quick, Merge)",
+  "Fractals and Recursion",
+  "Trigonometric Functions",
+  "Vector Addition and Subtraction",
+  "Projectile Motion",
+  "Simple Harmonic Motion",
+  "Crystal Lattice Structures",
+  "Benzene Ring Structure",
+  "Platonic Solids",
+  "Tesseract (4D Hypercube)",
 ];
 
 const App: React.FC = () => {
@@ -103,6 +118,20 @@ const App: React.FC = () => {
     error: null
   });
 
+  // Synchronous retry guard — refs update immediately (no stale closures).
+  // Without this, hundreds of onError callbacks can slip past the React-state
+  // hasRetried check before a single setState flush occurs, each spawning an
+  // LLM call.  The ref is the source of truth; state is for UI only.
+  const retryGuardRef = useRef<{ sectionId: number | null; hasRetried: boolean; isRetrying: boolean }>({
+    sectionId: null,
+    hasRetried: false,
+    isRetrying: false,
+  });
+
+  // Simulation edit panel state (fullscreen mode)
+  const [simEditLoading, setSimEditLoading] = useState(false);
+  const [simEditHistory, setSimEditHistory] = useState<SimEditHistoryItem[]>([]);
+
   // Handle keyboard shortcuts for fullscreen modes (ESC, arrow keys)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -144,6 +173,10 @@ const App: React.FC = () => {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isSimFullscreen, slidesFullscreen, appState, activeSectionId, fullscreenSlideIndex, isChatOpen]);
+
+  useEffect(() => {
+    setSimEditHistory([]);
+  }, [isSimFullscreen, activeSectionId]);
 
   // Auto-download dev logs when the page unloads (close tab / navigate away)
   useEffect(() => {
@@ -383,6 +416,8 @@ const App: React.FC = () => {
       const sections = await Gemini.generateSyllabus(title, selectedLevel, pdfSource?.text);
       // TEMPORARY: Unlock all sections for testing (revert later)
       const unlockedSections = sections.map(s => ({ ...s, isLocked: false }));
+      // Set error-correction budget: 1 retry per section, N sections total
+      Gemini.initErrorCorrectionBudget(unlockedSections.length);
       setCourse({ topic: title, sections: unlockedSections });
       setAppState(AppState.COURSE_OVERVIEW);
     } catch (error) {
@@ -525,113 +560,174 @@ const App: React.FC = () => {
     setParamValues(prev => ({ ...prev, [name]: value }));
   };
 
+  const finishSimEdit = useCallback((request: string, explanation: string, success: boolean) => {
+    setSimEditHistory(prev => {
+      const last = prev[prev.length - 1];
+      if (last?.pending) return [...prev.slice(0, -1), { ...last, explanation, success, pending: false }];
+      return [...prev, { userRequest: request, explanation, success }];
+    });
+  }, []);
+
+  const handleSimulationEdit = useCallback(async (request: string) => {
+    if (!activeSectionId || !activeContent || !course) return;
+    // Use only fully-completed, non-pending edits as context.
+    // This avoids leaking in-flight edits into Gemini's history.
+    const historyForContext = simEditHistory.filter(item => !item.pending);
+    setSimEditHistory(prev => [...prev, { userRequest: request, explanation: '', success: false, pending: true }]);
+    setSimEditLoading(true);
+    try {
+      const editedConfig = await Gemini.editSimulationCode(
+        activeContent.interactiveConfig.code,
+        activeContent.interactiveConfig.params,
+        request,
+        historyForContext
+      );
+      setCourse(prev => prev ? { ...prev, sections: prev.sections.map(s => s.id === activeSectionId && s.content ? { ...s, content: { ...s.content, interactiveConfig: editedConfig } } : s) } : null);
+      setActiveContent(prev => prev ? { ...prev, interactiveConfig: editedConfig } : null);
+      setParamValues(prev => Object.fromEntries(editedConfig.params.map(p => [p.name, prev[p.name] ?? p.defaultValue])));
+      const explanation = editedConfig.explanation || editedConfig.prompt.replace(/^User edit: /, '') || 'Changes applied.';
+      finishSimEdit(request, explanation, true);
+      devLogger.logSimulationEdit(activeSectionId, request, editedConfig.code, explanation, editedConfig.params);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      finishSimEdit(request, msg, false);
+      if (activeSectionId) devLogger.addEntry('sim-edit', 'SimEdit', `Section ${activeSectionId}: Edit failed`, { userRequest: request, error: msg });
+    } finally {
+      setSimEditLoading(false);
+    }
+  }, [activeSectionId, activeContent, course, finishSimEdit, simEditHistory]);
+
   // Handle simulation runtime errors with automatic retry
-  const handleSimulationError = async (error: Error) => {
+  const handleSimulationError = async (error: Error, errorSectionId: number) => {
     console.error('[SIMULATION ERROR]', error);
-    
-    // Only retry once per section
-    if (!activeSectionId || !activeContent || !course) {
-      console.warn('[SIMULATION ERROR] Cannot retry: missing context');
+
+    // Defensive check: sectionId must be provided
+    if (errorSectionId === undefined || errorSectionId === null) {
+      console.error('[SIMULATION ERROR] Cannot retry: sectionId is missing (BUG: all ThreeSandbox components must have a sectionId prop)');
+      return;
+    }
+
+    // ── Synchronous ref-based guard ──
+    // React state is stale in closures: if onError fires 500 times before a
+    // single setState flush, every invocation reads the OLD hasRetried=false
+    // and each one spawns an LLM call.  The ref updates synchronously so
+    // only the FIRST call gets through.
+    const guard = retryGuardRef.current;
+    if (guard.sectionId === errorSectionId && (guard.hasRetried || guard.isRetrying)) {
+      // Already retrying or already retried — silently drop
+      return;
+    }
+    // Immediately claim the lock (synchronous — visible to the next call)
+    retryGuardRef.current = { sectionId: errorSectionId, hasRetried: false, isRetrying: true };
+
+    // Find the section that had the error
+    if (!course) {
+      console.warn('[SIMULATION ERROR] Cannot retry: missing course');
+      retryGuardRef.current = { sectionId: errorSectionId, hasRetried: true, isRetrying: false };
+      return;
+    }
+
+    const errorSection = course.sections.find(s => s.id === errorSectionId);
+    if (!errorSection) {
+      console.warn(`[SIMULATION ERROR] Cannot retry: section ${errorSectionId} not found in course`);
+      retryGuardRef.current = { sectionId: errorSectionId, hasRetried: true, isRetrying: false };
+      return;
+    }
+
+    if (!errorSection.content) {
+      console.warn(`[SIMULATION ERROR] Cannot retry: section ${errorSectionId} has no content yet`);
+      retryGuardRef.current = { sectionId: errorSectionId, hasRetried: true, isRetrying: false };
       return;
     }
 
     // Log the simulation error with full code context
-    devLogger.logSimulationError(activeSectionId, error, activeContent.interactiveConfig.code);
-
-    // Check if we've already retried for this section
-    if (simulationRetryState.hasRetried && simulationRetryState.sectionId === activeSectionId) {
-      console.warn('[SIMULATION ERROR] Already retried for this section, giving up');
-      devLogger.addEntry('warn', 'SimRetry', `Section ${activeSectionId}: Giving up after retry`);
-      return;
-    }
+    devLogger.logSimulationError(errorSectionId, error, errorSection.content.interactiveConfig.code);
 
     console.log('[SIMULATION ERROR] Attempting automatic retry with error correction...');
-    devLogger.addEntry('info', 'SimRetry', `Section ${activeSectionId}: Starting error correction retry`);
-    
+    devLogger.addEntry('info', 'SimRetry', `Section ${errorSectionId}: Starting error correction retry`);
+
+    // Use section content at error time (not current activeContent which may have changed)
+    const errorSectionContent = errorSection.content;
+
     setSimulationRetryState({
       isRetrying: true,
       hasRetried: false,
-      sectionId: activeSectionId,
+      sectionId: errorSectionId,
       error: error.message
     });
 
     try {
-      const section = course.sections.find(s => s.id === activeSectionId);
+      const section = course.sections.find(s => s.id === errorSectionId);
       if (!section || !section.content) {
         throw new Error('Section not found');
       }
 
-      // Build context for error correction
-      const previousSections = course.sections
-        .filter(s => s.id < activeSectionId && s.content)
-        .map(s => ({
-          id: s.id,
-          title: s.title,
-          content: s.content!
-        }));
-      const previousContext = Gemini.buildRichPreviousContext(previousSections);
-      
-      const currentSlidesContext = section.content.slides.map((slide, idx) => {
-        const cleanContent = slide.content.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
-        return `Slide ${idx + 1} - ${slide.title}: ${cleanContent}`;
-      }).join('\n\n');
+      // Extract validation warnings if available
+      const validationWarnings = (error as any).validationWarnings as string[] | undefined;
 
-      // Get the simulation description from the interactive config
-      const simulationDescription = section.content.interactiveConfig.prompt;
-
-      // Call error correction API
-      const correctedConfig = await Gemini.generateInteractiveCodeErrorCorrection(
-        topic,
-        section.title,
-        simulationDescription,
-        previousContext,
-        currentSlidesContext,
-        section.id,
-        courseLevel,
-        activeContent.interactiveConfig.code,
+      // Call patch-based error correction API (uses Flash model, minimal edits)
+      const correctedConfig = await Gemini.fixSimulationCodeWithPatch(
+        errorSectionContent.interactiveConfig.code,
+        errorSectionContent.interactiveConfig.params,
         error.message,
-        error.stack
+        error.stack,
+        validationWarnings,
+        errorSectionId
       );
 
       console.log('[SIMULATION ERROR] Received corrected code, updating section...');
 
       // Log the corrected code
-      devLogger.logSimulationRetry(activeSectionId, error.message, correctedConfig.code);
+      devLogger.logSimulationRetry(errorSectionId, error.message, correctedConfig.code);
 
-      // Update the course with corrected code
+      // Update the course with corrected code (use captured section ID)
       setCourse(prevCourse => {
         if (!prevCourse) return null;
         return {
           ...prevCourse,
-          sections: prevCourse.sections.map(s => 
-            s.id === activeSectionId && s.content
+          sections: prevCourse.sections.map(s =>
+            s.id === errorSectionId && s.content
               ? { ...s, content: { ...s.content, interactiveConfig: correctedConfig } }
               : s
           )
         };
       });
 
-      // Update active content with corrected code
-      setActiveContent(prevContent => {
-        if (!prevContent) return null;
-        return { ...prevContent, interactiveConfig: correctedConfig };
-      });
+      // Only update active content if we're still viewing the same section
+      if (activeSectionId === errorSectionId) {
+        setActiveContent(prevContent => {
+          if (!prevContent) return null;
+          return { ...prevContent, interactiveConfig: correctedConfig };
+        });
 
+        // Update param values in case params changed (only if still on same section)
+        setParamValues(prev => Object.fromEntries(
+          correctedConfig.params.map(p => [p.name, prev[p.name] ?? p.defaultValue])
+        ));
+      } else {
+        console.log('[SIMULATION ERROR] User navigated away, fix applied to section but not displayed');
+      }
+
+      // Mark retry complete in both ref (synchronous) and state (UI)
+      retryGuardRef.current = { sectionId: errorSectionId, hasRetried: true, isRetrying: false };
       setSimulationRetryState({
         isRetrying: false,
         hasRetried: true,
-        sectionId: activeSectionId,
+        sectionId: errorSectionId,
         error: null
       });
 
       console.log('[SIMULATION ERROR] Retry complete - corrected code applied');
     } catch (retryError) {
       console.error('[SIMULATION ERROR] Retry failed:', retryError);
-      devLogger.addEntry('error', 'SimRetry', `Section ${activeSectionId}: Retry failed: ${retryError instanceof Error ? retryError.message : String(retryError)}`);
+      devLogger.addEntry('error', 'SimRetry', `Section ${errorSectionId}: Retry failed: ${retryError instanceof Error ? retryError.message : String(retryError)}`);
+
+      // Mark as retried in both ref and state so we don't loop again
+      retryGuardRef.current = { sectionId: errorSectionId, hasRetried: true, isRetrying: false };
       setSimulationRetryState({
         isRetrying: false,
         hasRetried: true,
-        sectionId: activeSectionId,
+        sectionId: errorSectionId,
         error: error.message
       });
     }
@@ -766,6 +862,7 @@ const App: React.FC = () => {
             </button>
           </div>
         </div>
+        <Analytics />
       </div>
     );
   }
@@ -1057,6 +1154,7 @@ const App: React.FC = () => {
             </div>
           </div>
         </div>
+        <Analytics />
       </div>
     );
   }
@@ -1274,6 +1372,7 @@ const App: React.FC = () => {
             Powered by <span style={{ color: '#4285f4' }}>{getProviderDisplayName()}</span>
           </p>
         </div>
+        <Analytics />
       </div>
     );
   }
@@ -1473,6 +1572,7 @@ const App: React.FC = () => {
             );
           })}
         </div>
+        <Analytics />
       </div>
     );
   }
@@ -1488,8 +1588,10 @@ const App: React.FC = () => {
           <div className="flex-grow relative">
             {/* 3D Canvas - Full Area */}
             <ThreeSandbox
+              key={activeSectionId}
               code={activeContent.interactiveConfig.code}
               params={paramValues}
+              sectionId={activeSectionId!}
               onError={handleSimulationError}
             />
 
@@ -1531,6 +1633,13 @@ const App: React.FC = () => {
                 Exit Fullscreen
               </button>
             </div>
+
+            {/* Simulation Edit Panel */}
+            <SimulationEditBar
+              onSubmit={handleSimulationEdit}
+              isLoading={simEditLoading}
+              history={simEditHistory}
+            />
           </div>
 
           {/* Right Side Controls Panel */}
@@ -1554,6 +1663,7 @@ const App: React.FC = () => {
               </p>
             </div>
           </div>
+          <Analytics />
         </div>
       );
     }
@@ -1630,8 +1740,10 @@ const App: React.FC = () => {
                   <div className="flex-grow relative rounded-2xl overflow-hidden border-2 border-[#252b5c] shadow-2xl">
                      {/* 3D Canvas */}
                      <ThreeSandbox
+                        key={activeSectionId}
                         code={activeContent.interactiveConfig.code}
                         params={paramValues}
+                        sectionId={activeSectionId!}
                         onError={handleSimulationError}
                      />
 
@@ -1684,6 +1796,7 @@ const App: React.FC = () => {
             </div>
           )}
         </main>
+        <Analytics />
       </div>
     );
   }

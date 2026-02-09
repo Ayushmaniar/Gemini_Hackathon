@@ -1,16 +1,17 @@
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect, useCallback } from 'react';
 import * as THREE from 'three';
 import * as Fiber from '@react-three/fiber';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { OrbitControls, PerspectiveCamera, Environment, Grid, Text } from '@react-three/drei';
 import { devLogger } from '../services/devLogger';
+import { validateSimulationCode } from '../utils/codeValidator';
 
 // Error boundary for catching runtime errors in generated code
 class SimulationErrorBoundary extends React.Component<
-  { children: React.ReactNode; code?: string; onError?: (error: Error) => void },
+  { children: React.ReactNode; code?: string; onError?: (error: Error) => void; validationWarnings?: string[] },
   { hasError: boolean; error: string; errorReported: boolean }
 > {
-  constructor(props: { children: React.ReactNode; code?: string; onError?: (error: Error) => void }) {
+  constructor(props: { children: React.ReactNode; code?: string; onError?: (error: Error) => void; validationWarnings?: string[] }) {
     super(props);
     this.state = { hasError: false, error: '', errorReported: false };
   }
@@ -29,15 +30,17 @@ class SimulationErrorBoundary extends React.Component<
       errorStack: error.stack,
       componentStack: errorInfo.componentStack,
       code: this.props.code?.substring(0, 10_000),
+      validationWarnings: this.props.validationWarnings,
     });
-    
+
     // Call error callback if provided and not already reported
     if (this.props.onError && !this.state.errorReported) {
       this.setState({ errorReported: true });
-      // Create enhanced error with stack trace
-      const enhancedError = new Error(error.message);
+      // Create enhanced error with stack trace AND validation warnings
+      const enhancedError = new Error(error.message) as Error & { validationWarnings?: string[] };
       enhancedError.stack = error.stack;
       enhancedError.name = error.name;
+      enhancedError.validationWarnings = this.props.validationWarnings;
       this.props.onError(enhancedError);
     }
   }
@@ -116,7 +119,8 @@ declare global {
 interface ThreeSandboxProps {
   code: string;
   params: Record<string, number>;
-  onError?: (error: Error) => void;
+  sectionId: number; // Section ID to prevent race conditions
+  onError?: (error: Error, sectionId: number) => void;
 }
 
 // ============================================================================
@@ -162,6 +166,26 @@ function extractMaterialProps(mat: any): Record<string, any> {
 // 'center')" error during WebGLRenderer.render → Frustum.intersectsObject.
 const FRUSTUM_CULL_DISABLED_TYPES = new Set(['mesh', 'line', 'lineSegments', 'points']);
 
+// --------------- Auto-fix log deduplication ---------------
+// Prevents thousands of identical warnings when safeCreateElement fires every frame.
+const autoFixCounts = new Map<string, number>();
+
+function logAutoFixOnce(type: string, details: string) {
+  const key = `${type}::${details}`;
+  const prev = autoFixCounts.get(key) ?? 0;
+  autoFixCounts.set(key, prev + 1);
+  if (prev === 0) {
+    // First occurrence — log normally
+    console.warn(`[ThreeSandbox] Auto-fixed: ${details}`);
+    devLogger.logAutoFix(type, details);
+  }
+  // Subsequent duplicates are silently counted
+}
+
+function resetAutoFixCounts() {
+  autoFixCounts.clear();
+}
+
 /**
  * Build a safe React-like object whose createElement intercepts THREE.js
  * geometry / material instances that the AI accidentally passes as React
@@ -182,42 +206,33 @@ function createSafeReact() {
         if (child.isBufferGeometry && child.type && child.type !== 'BufferGeometry') {
           const elName = lcFirst(child.type);
           const args = child.parameters ? Object.values(child.parameters) : [];
-          console.warn(`[ThreeSandbox] Auto-fixed: converted THREE.${child.type} instance to <${elName}> element`);
-          devLogger.logAutoFix('geometry-child-to-element', `THREE.${child.type} -> <${elName}>`);
+          logAutoFixOnce('geometry-child-to-element', `converted THREE.${child.type} instance to <${elName}> element`);
           return originalCreateElement(elName, args.length ? { args } : undefined);
         }
         // Material instance passed as a child (e.g. new THREE.MeshStandardMaterial())
         if (child.isMaterial && child.type) {
           const elName = lcFirst(child.type);
           const matProps = extractMaterialProps(child);
-          console.warn(`[ThreeSandbox] Auto-fixed: converted THREE.${child.type} instance to <${elName}> element`);
-          devLogger.logAutoFix('material-child-to-element', `THREE.${child.type} -> <${elName}>`);
+          logAutoFixOnce('material-child-to-element', `converted THREE.${child.type} instance to <${elName}> element`);
           return originalCreateElement(elName, matProps);
         }
       }
       return child;
     });
 
-    // --- Fix props: geometry / material passed as props on mesh elements -----
+    // --- Fix props: React elements incorrectly passed as geometry/material props ---
+    // NOTE: THREE.js geometry/material INSTANCES as props are VALID in R3F and must
+    // NOT be converted — R3F handles them natively, and converting would destroy
+    // post-construction modifications (.rotateX(), .setAttribute(), custom attributes).
+    // Only React ELEMENTS passed as geometry/material props need fixing.
     let fixedProps = props;
     const propsChildren: any[] = [];
+    const GEOMETRY_PROP_TYPES = new Set(['mesh', 'line', 'lineSegments', 'points']);
 
-    if (typeof type === 'string' && type === 'mesh' && props) {
+    if (typeof type === 'string' && GEOMETRY_PROP_TYPES.has(type) && props) {
       fixedProps = { ...props };
 
-      // geometry prop that is a non-Buffer geometry instance -> move to child
-      if (fixedProps.geometry && fixedProps.geometry.isBufferGeometry &&
-          fixedProps.geometry.type && fixedProps.geometry.type !== 'BufferGeometry') {
-        const geo = fixedProps.geometry;
-        const elName = lcFirst(geo.type);
-        const args = geo.parameters ? Object.values(geo.parameters) : [];
-        console.warn(`[ThreeSandbox] Auto-fixed: moved geometry prop THREE.${geo.type} to <${elName}> child`);
-        devLogger.logAutoFix('geometry-prop-to-child', `THREE.${geo.type} -> <${elName}> child on mesh`);
-        propsChildren.push(originalCreateElement(elName, args.length ? { args } : undefined));
-        delete fixedProps.geometry;
-      }
-
-      // geometry prop that is a React element (e.g. from useMemo caching
+      // geometry prop that is a React element (e.g. from useMemo returning
       // React.createElement('sphereGeometry',...)) -> move to child.
       // React elements have $$typeof and a string type like 'sphereGeometry'.
       // Passing a React element as the `geometry` prop causes:
@@ -226,31 +241,44 @@ function createSafeReact() {
       if (fixedProps.geometry && typeof fixedProps.geometry === 'object' &&
           !fixedProps.geometry.isBufferGeometry &&
           (fixedProps.geometry.$$typeof || (fixedProps.geometry.type && typeof fixedProps.geometry.type === 'string'))) {
-        console.warn(`[ThreeSandbox] Auto-fixed: moved React element geometry prop to child on mesh`);
-        devLogger.logAutoFix('react-element-geometry-to-child', `React element (${fixedProps.geometry.type || 'unknown'}) moved from geometry prop to child`);
+        logAutoFixOnce('react-element-geometry-to-child', `moved React element geometry (${fixedProps.geometry.type || 'unknown'}) prop to child`);
         propsChildren.push(fixedProps.geometry);
         delete fixedProps.geometry;
-      }
-
-      // material prop that is a Material instance -> move to child
-      if (fixedProps.material && fixedProps.material.isMaterial) {
-        const mat = fixedProps.material;
-        const elName = lcFirst(mat.type);
-        const matProps = extractMaterialProps(mat);
-        console.warn(`[ThreeSandbox] Auto-fixed: moved material prop THREE.${mat.type} to <${elName}> child`);
-        devLogger.logAutoFix('material-prop-to-child', `THREE.${mat.type} -> <${elName}> child on mesh`);
-        propsChildren.push(originalCreateElement(elName, matProps));
-        delete fixedProps.material;
       }
 
       // material prop that is a React element -> move to child
       if (fixedProps.material && typeof fixedProps.material === 'object' &&
           !fixedProps.material.isMaterial &&
           (fixedProps.material.$$typeof || (fixedProps.material.type && typeof fixedProps.material.type === 'string'))) {
-        console.warn(`[ThreeSandbox] Auto-fixed: moved React element material prop to child on mesh`);
-        devLogger.logAutoFix('react-element-material-to-child', `React element (${fixedProps.material.type || 'unknown'}) moved from material prop to child`);
+        logAutoFixOnce('react-element-material-to-child', `moved React element material (${fixedProps.material.type || 'unknown'}) prop to child`);
         propsChildren.push(fixedProps.material);
         delete fixedProps.material;
+      }
+    }
+
+    // --- Wrap event handler props (onClick, onPointerOver, etc.) with try-catch ---
+    // Event handlers run in browser event dispatch, outside React's render phase,
+    // so error boundaries can't catch them. We wrap to report errors once.
+    if (fixedProps && simErrorHandlerRef.current) {
+      const handlerKeys = Object.keys(fixedProps).filter(k => /^on[A-Z]/.test(k) && typeof fixedProps[k] === 'function');
+      if (handlerKeys.length > 0) {
+        fixedProps = { ...fixedProps };
+        for (const key of handlerKeys) {
+          const original = fixedProps[key];
+          fixedProps[key] = (...args: any[]) => {
+            try {
+              return original(...args);
+            } catch (err) {
+              if (!simErrorHandlerRef.fired && simErrorHandlerRef.current) {
+                simErrorHandlerRef.fired = true;
+                const error = err instanceof Error ? err : new Error(String(err));
+                console.error(`[SIMULATION ${key} ERROR]`, error);
+                devLogger.addEntry('sim-error', 'EventHandlerError', `Caught in ${key}: ${error.message}`);
+                simErrorHandlerRef.current(error);
+              }
+            }
+          };
+        }
       }
     }
 
@@ -272,6 +300,11 @@ function createSafeReact() {
   });
 }
 
+// Module-level ref for the current simulation's error handler.
+// Set by GeneratedScene before render, used by SafeReact to wrap event handlers.
+// This avoids recreating the proxy per-render while still routing errors correctly.
+const simErrorHandlerRef: { current: ((error: Error) => void) | null; fired: boolean } = { current: null, fired: false };
+
 // Create the safe React proxy once at module level
 const SafeReact = createSafeReact();
 
@@ -279,8 +312,80 @@ const SafeReact = createSafeReact();
 // It runs inside Canvas, so we can call useThree() once here and pass a getter to
 // generated code. That way generated code can call useThree() inside loops (e.g. .map)
 // without violating the Rules of Hooks (same hook count every render).
-const GeneratedScene: React.FC<{ code: string; params: Record<string, number> }> = ({ code, params }) => {
+const GeneratedScene: React.FC<{
+  code: string;
+  params: Record<string, number>;
+  onError?: (error: Error) => void;
+  onValidationWarnings?: (warnings: string[]) => void;
+}> = ({ code, params, onError, onValidationWarnings }) => {
   const three = useThree();
+  const [validationState, setValidationState] = useState<'validating' | 'valid' | 'invalid'>('validating');
+  const validationWarningsRef = React.useRef<string[]>([]);
+  const useFrameErrorRef = React.useRef<boolean>(false);
+
+  // Reset useFrame error state and auto-fix log counts when code changes (new code = new chance)
+  useEffect(() => {
+    useFrameErrorRef.current = false;
+    resetAutoFixCounts();
+  }, [code]);
+
+  // Pre-validate code before execution
+  useEffect(() => {
+    setValidationState('validating');
+
+    // Validate code for static errors
+    const validation = validateSimulationCode(code);
+
+    // Store warnings for later use in error correction
+    validationWarningsRef.current = validation.warnings || [];
+
+    // Notify parent of warnings
+    onValidationWarnings?.(validationWarningsRef.current);
+
+    // Log warnings (potential issues that won't prevent execution)
+    if (validation.warnings && validation.warnings.length > 0) {
+      console.warn('[VALIDATION] Pre-execution warnings:', validation.warnings);
+      devLogger.addEntry('warn', 'SimValidation',
+        `Found ${validation.warnings.length} warning(s) before execution`,
+        {
+          warnings: validation.warnings,
+          code: code?.substring(0, 1000) // First 1000 chars for context
+        }
+      );
+    }
+
+    if (!validation.valid) {
+      console.warn('[VALIDATION] Pre-execution errors found:', validation.errors);
+
+      // Log to devLogger
+      devLogger.addEntry('error', 'SimValidation',
+        `Found ${validation.errors.length} error(s) before execution - triggering correction`,
+        {
+          errors: validation.errors,
+          code: code?.substring(0, 10_000)
+        }
+      );
+
+      // Trigger error correction WITHOUT executing broken code
+      const errorMessage = validation.errors
+        .map(e => `Line ${e.line}: ${e.message}`)
+        .join('\n');
+
+      // Attach warnings to error for context
+      const enhancedError = new Error(errorMessage) as Error & { validationWarnings?: string[] };
+      enhancedError.validationWarnings = validationWarningsRef.current;
+
+      if (onError) {
+        onError(enhancedError);
+      }
+      setValidationState('invalid');
+      return;
+    }
+
+    console.log('[VALIDATION] Code passed pre-execution validation ✓');
+    setValidationState('valid');
+  }, [code, onError, onValidationWarnings]);
+
   const Component = useMemo(() => {
     try {
       // We wrap the code in a function constructor to create a component
@@ -290,25 +395,76 @@ const GeneratedScene: React.FC<{ code: string; params: Record<string, number> }>
         const { React, THREE, useFrame, useThree, Text, params } = args;
         ${code}
       `;
-      
+
       // eslint-disable-next-line no-new-func
       const func = new Function('args', body);
-      
-      return (props: { params: Record<string, number>; useThreeValue: ReturnType<typeof useThree> }) => {
-        return func({
+
+      return (props: { params: Record<string, number>; useThreeValue: ReturnType<typeof useThree>; onUseFrameError: (error: Error) => void; useFrameErrorRef: React.MutableRefObject<boolean> }) => {
+        // Wrap useFrame to catch errors in the animation loop.
+        // React error boundaries can't catch useFrame errors since they run
+        // in requestAnimationFrame, not in React's render phase.
+        const safeUseFrame: typeof useFrame = (callback, priority) => {
+          return useFrame((state, delta, frame) => {
+            // Stop calling the callback after an error to prevent spam
+            if (props.useFrameErrorRef.current) return;
+            try {
+              callback(state, delta, frame);
+            } catch (err) {
+              if (!props.useFrameErrorRef.current) {
+                props.useFrameErrorRef.current = true;
+                const error = err instanceof Error ? err : new Error(String(err));
+                console.error('[SIMULATION useFrame ERROR]', error);
+                devLogger.addEntry('sim-error', 'UseFrameError', `Caught in useFrame: ${error.message}`, {
+                  errorName: error.name,
+                  errorMessage: error.message,
+                  errorStack: error.stack,
+                });
+                props.onUseFrameError(error);
+              }
+            }
+          }, priority);
+        };
+
+        // Set module-level error handler for SafeReact event handler wrapping
+        simErrorHandlerRef.current = props.onUseFrameError;
+        simErrorHandlerRef.fired = props.useFrameErrorRef.current;
+
+        const result = func({
           React: SafeReact,   // Use safe proxy instead of raw React
           THREE,
-          useFrame,
+          useFrame: safeUseFrame,
           useThree: () => props.useThreeValue,
           Text,
           params: props.params
         });
+
+        // Guard: if the generated code returned nothing (undefined/null), it's
+        // almost certainly a missing `return` statement. new Function() doesn't
+        // auto-return the last expression, and React 19 silently accepts
+        // undefined (renders blank). Report as an error so the retry/correction
+        // flow can ask Gemini to add the missing return.
+        if (result === undefined || result === null) {
+          if (!props.useFrameErrorRef.current) {
+            props.useFrameErrorRef.current = true;
+            const error = new Error(
+              'Component returned nothing (undefined). ' +
+              'The code body is missing a `return` statement before the final React.createElement() call.'
+            );
+            console.error('[SIMULATION RENDER ERROR]', error.message);
+            devLogger.addEntry('sim-error', 'MissingReturn', error.message);
+            props.onUseFrameError(error);
+          }
+          return null;
+        }
+
+        return result;
       };
     } catch (err) {
       console.error("Error compiling generated code:", err);
       devLogger.addEntry('sim-error', 'CodeCompilation', `Failed to compile generated code: ${err instanceof Error ? err.message : String(err)}`, {
         error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
         code: code?.substring(0, 10_000),
+        validationWarnings: validationWarningsRef.current,
       });
       return () => (
         <group>
@@ -321,10 +477,26 @@ const GeneratedScene: React.FC<{ code: string; params: Record<string, number> }>
     }
   }, [code]);
 
-  return <Component params={params} useThreeValue={three} />;
+  // Only render if validation passed
+  if (validationState === 'validating') {
+    return null; // Brief loading state during validation
+  }
+
+  if (validationState === 'invalid') {
+    return null; // Don't render broken code, error correction is triggered
+  }
+
+  return <Component params={params} useThreeValue={three} onUseFrameError={onError || (() => {})} useFrameErrorRef={useFrameErrorRef} />;
 };
 
-export const ThreeSandbox: React.FC<ThreeSandboxProps> = ({ code, params, onError }) => {
+export const ThreeSandbox: React.FC<ThreeSandboxProps> = ({ code, params, sectionId, onError }) => {
+  const [validationWarnings, setValidationWarnings] = useState<string[]>([]);
+
+  // Wrap onError to include sectionId
+  const handleError = useCallback((error: Error) => {
+    onError?.(error, sectionId);
+  }, [onError, sectionId]);
+
   return (
     <div className="w-full h-full rounded-lg overflow-hidden shadow-inner three-sandbox">
       <Canvas shadows>
@@ -343,16 +515,38 @@ export const ThreeSandbox: React.FC<ThreeSandboxProps> = ({ code, params, onErro
           position={[-5, 5, -5]}
           intensity={0.3}
         />
-        
+
         {/* Subtle environment lighting for better materials */}
         <Environment preset="night" />
 
         {/* The AI Generated Content */}
-        <SimulationErrorBoundary code={code} onError={onError}>
-          <GeneratedScene code={code} params={params} />
+        <SimulationErrorBoundary code={code} onError={handleError} validationWarnings={validationWarnings}>
+          <GeneratedSceneWithWarnings
+            code={code}
+            params={params}
+            onError={handleError}
+            onValidationWarnings={setValidationWarnings}
+          />
         </SimulationErrorBoundary>
 
       </Canvas>
     </div>
+  );
+};
+
+// Wrapper component to lift validation warnings to parent
+const GeneratedSceneWithWarnings: React.FC<{
+  code: string;
+  params: Record<string, number>;
+  onError?: (error: Error) => void;
+  onValidationWarnings: (warnings: string[]) => void;
+}> = ({ code, params, onError, onValidationWarnings }) => {
+  return (
+    <GeneratedScene
+      code={code}
+      params={params}
+      onError={onError}
+      onValidationWarnings={onValidationWarnings}
+    />
   );
 };

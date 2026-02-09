@@ -13,7 +13,7 @@
 export interface LogEntry {
   timestamp: string;       // ISO timestamp
   elapsed: number;         // ms since session start
-  level: 'log' | 'warn' | 'error' | 'info' | 'sim-code' | 'sim-error' | 'sim-retry' | 'sim-autofix';
+  level: 'log' | 'warn' | 'error' | 'info' | 'sim-code' | 'sim-error' | 'sim-retry' | 'sim-autofix' | 'sim-edit';
   source: string;          // e.g. 'ThreeSandbox', 'App', 'console', 'sanitize'
   message: string;
   data?: any;              // Optional structured data (code, params, stack trace, etc.)
@@ -89,11 +89,6 @@ class DevLoggerService {
 
   /** Start a new logging session for a topic. Ends any previous session. */
   startSession(topic: string, level: string): void {
-    // If there's an existing session with entries, auto-save it
-    if (this.session && this.session.entries.length > 0) {
-      this.downloadLog();
-    }
-
     const now = new Date();
     this.sessionStart = performance.now();
 
@@ -113,17 +108,12 @@ class DevLoggerService {
     this.startIntercepting();
   }
 
-  /** End the current session and auto-download the log file. */
+  /** End the current session. */
   endSession(): void {
     if (!this.session) return;
 
     this.session.endedAt = new Date().toISOString();
     this.addEntry('info', 'DevLogger', 'Session ended');
-
-    // Auto-download if there are meaningful entries (more than just start/end)
-    if (this.session.entries.length > 2) {
-      this.downloadLog();
-    }
 
     this.stopIntercepting();
     this.session = null;
@@ -196,6 +186,23 @@ class DevLoggerService {
       originalError,
       correctedCode,
       correctedCodeLength: correctedCode.length,
+    });
+  }
+
+  /** Log a user-initiated simulation edit (via fullscreen edit bar) */
+  logSimulationEdit(
+    sectionId: number,
+    userRequest: string,
+    editedCode: string,
+    explanation: string,
+    params: unknown[]
+  ): void {
+    this.addEntry('sim-edit', 'SimEdit', `Section ${sectionId}: "${userRequest}"`, {
+      userRequest,
+      editedCode: editedCode.length > 10_000 ? editedCode.slice(0, 10_000) + '\n... [TRUNCATED]' : editedCode,
+      explanation,
+      params,
+      editedCodeLength: editedCode.length,
     });
   }
 
@@ -375,6 +382,7 @@ class DevLoggerService {
       warnings: this.session.entries.filter(e => e.level === 'warn').length,
       simCodes: this.session.entries.filter(e => e.level === 'sim-code').length,
       simRetries: this.session.entries.filter(e => e.level === 'sim-retry').length,
+      simEdits: this.session.entries.filter(e => e.level === 'sim-edit').length,
       autoFixes: this.session.entries.filter(e => e.level === 'sim-autofix').length,
       durationMs: Math.round(performance.now() - this.sessionStart),
     };

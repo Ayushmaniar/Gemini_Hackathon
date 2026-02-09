@@ -27,7 +27,7 @@ export const SlideChatbot: React.FC<SlideChatbotProps> = ({
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -43,11 +43,12 @@ export const SlideChatbot: React.FC<SlideChatbotProps> = ({
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
 
+    const now = Date.now();
     const userMessage: ChatMessage = {
-      id: `user-${Date.now()}`,
+      id: `user-${now}`,
       role: 'user',
       content: trimmed,
-      timestamp: Date.now(),
+      timestamp: now,
     };
 
     setMessages(prev => [...prev, userMessage]);
@@ -65,22 +66,20 @@ export const SlideChatbot: React.FC<SlideChatbotProps> = ({
         learningLevel
       );
 
-      const assistantMessage: ChatMessage = {
-        id: `assistant-${Date.now()}`,
-        role: 'assistant',
-        content: response,
-        timestamp: Date.now(),
-      };
-
-      setMessages(prev => [...prev, assistantMessage]);
+      setMessages(prev => [
+        ...prev,
+        { id: `assistant-${Date.now()}`, role: 'assistant', content: response, timestamp: Date.now() },
+      ]);
     } catch (err) {
-      const errorMessage: ChatMessage = {
-        id: `error-${Date.now()}`,
-        role: 'assistant',
-        content: 'Sorry, I encountered an error. Please try again.',
-        timestamp: Date.now(),
-      };
-      setMessages(prev => [...prev, errorMessage]);
+      setMessages(prev => [
+        ...prev,
+        {
+          id: `error-${Date.now()}`,
+          role: 'assistant',
+          content: 'Sorry, I encountered an error. Please try again.',
+          timestamp: Date.now(),
+        },
+      ]);
       console.error('Chatbot error:', err);
     } finally {
       setIsLoading(false);
@@ -90,7 +89,6 @@ export const SlideChatbot: React.FC<SlideChatbotProps> = ({
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      e.stopPropagation();
       handleSend();
     }
   };
@@ -192,15 +190,15 @@ export const SlideChatbot: React.FC<SlideChatbotProps> = ({
 
       {/* Input */}
       <div className="slide-chatbot-input-area">
-        <input
+        <textarea
           ref={inputRef}
-          type="text"
           value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Ask a question..."
           className="slide-chatbot-input"
           disabled={isLoading}
+          rows={2}
         />
         <button
           onClick={handleSend}

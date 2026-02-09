@@ -1,6 +1,7 @@
-import { Section, Slide, QuizQuestion, InteractiveConfig, ControlParam, SectionContent, LearningLevel, ChatMessage } from "../types";
+import { Section, Slide, QuizQuestion, InteractiveConfig, ControlParam, SectionContent, LearningLevel, ChatMessage, SimulationEdit, SimulationEditResult, SimEditHistoryItem } from "../types";
 import { compressSlideHtml } from "../utils/htmlUtils";
 import { devLogger } from "./devLogger";
+import { validateSimulationCode } from "../utils/codeValidator";
 
 // ============================================================================
 // Model Configuration: Gemini 3.0 Flash + Pro Hybrid Approach
@@ -133,6 +134,145 @@ const UNICODE_REPLACE_RE = new RegExp(
   'g'
 );
 
+// ============================================================================
+// React Three Fiber Error Patterns
+// ============================================================================
+// Common error patterns in AI-generated R3F code with their fixes.
+// Used by both generateInteractiveCodeErrorCorrection and fixSimulationCodeWithPatch.
+const R3F_ERROR_PATTERNS = `
+COMMON ERROR PATTERNS AND FIXES:
+
+1. **"LineDashMaterial is not part of the THREE namespace"**
+   - WRONG: React.createElement('lineDashMaterial', ...)
+   - CORRECT: Use 'lineBasicMaterial' or 'lineDashedMaterial' (these exist in THREE.js)
+
+2. **"e.getIndex is not a function"** or **geometry errors**
+   - WRONG: Passing a standard geometry to 'line' or 'points' elements incorrectly
+   - CORRECT: For lines, create BufferGeometry via React.useMemo:
+     \`\`\`
+     const lineGeo = React.useMemo(() => {
+       const geo = new THREE.BufferGeometry();
+       geo.setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(1,0,0)]);
+       return geo;
+     }, []);
+     React.createElement('line', { geometry: lineGeo }, React.createElement('lineBasicMaterial', { color: '#fff' }))
+     \`\`\`
+
+3. **"e.remove is not a function"** or **removeFromParent errors**
+   - WRONG: Calling methods on wrong object types or trying to remove incompatible objects
+   - CORRECT: Ensure you're working with proper THREE.js Object3D instances
+
+4. **"Objects are not valid as a React child"**
+   - WRONG: React.createElement('mesh', null, new THREE.BoxGeometry(1,1,1))
+   - CORRECT: React.createElement('mesh', null, React.createElement('boxGeometry', { args: [1,1,1] }))
+
+5. **"Cannot convert undefined or null to object"**
+   - WRONG: Accessing properties on undefined objects or refs not yet initialized
+   - CORRECT: Add null checks: if (ref.current) { ... }
+
+6. **"Cannot read properties of undefined (reading 'center')" / boundingSphere errors**
+   - The runtime automatically sets frustumCulled=false on all 3D elements, so this should not occur
+   - Do NOT call .computeBoundingSphere() anywhere — the runtime handles frustum culling
+   - If you see this error, just remove any .computeBoundingSphere() calls from the code
+
+7. **"attr.computeBoundingSphere is not a function"**
+   - WRONG: Calling .computeBoundingSphere() on a BufferAttribute (e.g. geometry.attributes.position)
+   - WRONG: \`const attr = ref.current.geometry.attributes.position; attr.computeBoundingSphere();\`
+   - CORRECT: Simply remove all .computeBoundingSphere() calls. The runtime handles this automatically via frustumCulled=false.
+   - BufferAttribute does NOT have a computeBoundingSphere method — only BufferGeometry does.
+   - This error fires every frame inside useFrame, causing thousands of console errors.
+
+8. **"geometry.addEventListener is not a function"** or **"_.addEventListener is not a function"**
+   - This happens when a React element is passed as the \`geometry\` prop on a mesh instead of a THREE.BufferGeometry instance.
+   - WRONG: Caching a React element in useMemo, then using it as geometry prop:
+     \`\`\`
+     const sphereGeo = React.useMemo(() => React.createElement('sphereGeometry', { args: [1, 32, 32] }), []);
+     React.createElement('mesh', { geometry: sphereGeo }, ...) // CRASH!
+     \`\`\`
+   - WRONG: Using React element with primitive:
+     \`\`\`
+     const torusGeo = React.useMemo(() => React.createElement('torusGeometry', { args: [3, 0.4, 16, 50] }), []);
+     React.createElement('primitive', { object: torusGeo }) // CRASH!
+     \`\`\`
+   - CORRECT FOR MESH: Put geometry as a CHILD element, never as a prop, and don't cache it in useMemo:
+     \`\`\`
+     React.createElement('mesh', null,
+       React.createElement('sphereGeometry', { args: [1, 32, 32] }),
+       React.createElement('meshStandardMaterial', { color: '#4a9eff' })
+     )
+     \`\`\`
+   - CORRECT FOR PRIMITIVE: Cache the actual THREE.js geometry instance, not the React element:
+     \`\`\`
+     const torusGeo = React.useMemo(() => new THREE.TorusGeometry(3, 0.4, 16, 50), []);
+     React.createElement('primitive', { object: torusGeo })
+     \`\`\`
+   - REMEMBER: For mesh elements, geometry and material are ALWAYS children, NEVER props.
+   - The ONLY element type that accepts a geometry prop is 'line', 'lineSegments', and 'points' (with a real BufferGeometry instance).
+   - FIX: If you see cached React.createElement geometry elements being used as props or with primitive, either (1) put them as direct children of mesh, or (2) replace the createElement with \`new THREE.XxxGeometry(...)\` for use with primitive.
+
+9. **"Rendered more hooks than during the previous render"** or **"Cannot read properties of undefined (reading 'length')"**
+   - CAUSE: React hooks (useMemo, useRef, useEffect, useState) called INSIDE if/else, for/while blocks
+   - React requires hooks to be called in the EXACT SAME ORDER every render. Conditional hooks break this rule.
+   - WRONG:
+     \`\`\`
+     if (isBlackHole) {
+       const geo = React.useMemo(() => { ... }, [dep]); // FATAL - hook inside if!
+       children.push(React.createElement('line', { geometry: geo }));
+     }
+     \`\`\`
+   - CORRECT:
+     \`\`\`
+     const geo = React.useMemo(() => { ... }, [dep]); // Hook at top level - ALWAYS runs
+     if (isBlackHole) {
+       children.push(React.createElement('line', { geometry: geo })); // Only render conditionally
+     }
+     \`\`\`
+   - FIX: Move ALL React.useRef, React.useMemo, React.useEffect, React.useState calls to the TOP LEVEL of the code, before any if/for/while blocks. The results can then be used conditionally.
+
+10. **"CustomCurve is not defined"** or **"[ClassName] is not defined"** (class definition errors)
+   - CAUSE: Defining a class (e.g., extending THREE.Curve) INSIDE a React.useMemo or other hook callback
+   - JavaScript class declarations inside functions don't hoist properly when the code is sandboxed
+   - WRONG:
+     \`\`\`
+     const tubeGeo = React.useMemo(() => {
+       class MyCurve extends THREE.Curve {
+         getPoint(t) { return new THREE.Vector3(t, Math.sin(t), 0); }
+       }
+       return new THREE.TubeGeometry(new MyCurve(), 20, 0.4, 12, false);
+     }, []);
+     \`\`\`
+   - CORRECT: Define the class at the TOP LEVEL, before all hooks:
+     \`\`\`
+     class MyCurve extends THREE.Curve {
+       getPoint(t) { return new THREE.Vector3(t, Math.sin(t), 0); }
+     }
+     
+     const tubeGeo = React.useMemo(() => {
+       return new THREE.TubeGeometry(new MyCurve(), 20, 0.4, 12, false);
+     }, []);
+     \`\`\`
+   - FIX: Move ALL class declarations to the top level of your code, before any React hooks or function definitions.
+
+11. **"xxx.dispose is not a function"** (geometry dispose crash)
+   - CAUSE: A React element object was assigned to \`.geometry\` instead of a real THREE.js geometry instance.
+     This happens when a sanitizer or code generator wraps imperative geometry construction with React.createElement.
+   - WRONG (assigns a React element, not a geometry):
+     \`\`\`
+     useFrame(() => {
+       mesh.geometry.dispose();
+       mesh.geometry = React.createElement('tubeGeometry', { args: [curve, 64, 0.5, 8, false] });
+     });
+     \`\`\`
+   - CORRECT (assigns a real THREE.js geometry):
+     \`\`\`
+     useFrame(() => {
+       mesh.geometry.dispose();
+       mesh.geometry = new THREE.TubeGeometry(curve, 64, 0.5, 8, false);
+     });
+     \`\`\`
+   - FIX: When assigning to \`.geometry\` imperatively (outside JSX), always use \`new THREE.XxxGeometry(...)\` directly. Do NOT wrap it in React.createElement — that produces a React element object, not a geometry.
+`;
+
 /**
  * Detect React hooks (useMemo, useRef, useEffect, useState, useCallback) that
  * are called inside conditional blocks (if/else, for, while) and hoist them to
@@ -261,6 +401,78 @@ function hoistConditionalHooks(code: string): string {
 function sanitizeSimulationCode(code: string): string {
   let sanitized = code;
 
+  // --- Strip redeclarations of wrapper-provided variables ---
+  // ThreeSandbox wraps code with: const { React, THREE, useFrame, useThree, Text, params } = args;
+  // AI sometimes redeclares these causing "Identifier 'X' has already been declared" errors.
+  // Also strip import/export statements which are invalid in Function() constructor context.
+  const PROVIDED_VARS = new Set(['React', 'THREE', 'useFrame', 'useThree', 'Text', 'params']);
+  sanitized = sanitized.split('\n').map(line => {
+    const trimmed = line.trim();
+
+    // Remove import statements (invalid in Function constructor)
+    if (trimmed.startsWith('import ')) {
+      console.warn(`[sanitizeSimulationCode] Removed import: ${trimmed.substring(0, 80)}`);
+      devLogger.logAutoFix('strip-import', `Removed: ${trimmed.substring(0, 80)}`);
+      return '';
+    }
+
+    // Strip export keywords (invalid in Function constructor): export default ..., export const ...
+    if (trimmed.startsWith('export default ') || trimmed.startsWith('export ')) {
+      const stripped = trimmed.replace(/^export\s+default\s+/, '').replace(/^export\s+/, '');
+      console.warn(`[sanitizeSimulationCode] Stripped export keyword: ${trimmed.substring(0, 60)}`);
+      devLogger.logAutoFix('strip-export', `Stripped export from: ${trimmed.substring(0, 60)}`);
+      return line.replace(trimmed, stripped);
+    }
+
+    // Rename function declarations that shadow provided variables
+    // Pattern: function useFrame(...) { ... } → function _shadow_useFrame(...) { ... }
+    // We rename instead of removing because the body may span multiple lines.
+    // Calls to useFrame() will correctly use the wrapper-provided version.
+    const funcDeclMatch = trimmed.match(/^function\s+(\w+)\s*\(/);
+    if (funcDeclMatch && PROVIDED_VARS.has(funcDeclMatch[1])) {
+      const name = funcDeclMatch[1];
+      console.warn(`[sanitizeSimulationCode] Renamed function shadowing provided var: ${name}`);
+      devLogger.logAutoFix('rename-func-shadow', `Renamed: function ${name} → function _shadow_${name}`);
+      return line.replace(`function ${name}`, `function _shadow_${name}`);
+    }
+
+    // Handle destructuring: const { useFrame, customHook } = obj
+    const destructureMatch = trimmed.match(/^((?:const|let|var)\s+)\{([^}]+)\}(\s*=\s*.+)$/);
+    if (destructureMatch) {
+      const keyword = destructureMatch[1];        // "const "
+      const namesStr = destructureMatch[2];        // "useFrame, customHook"
+      const rhs = destructureMatch[3];             // " = obj;"
+      const names = namesStr.split(',').map(s => s.trim()).filter(s => s.length > 0);
+      const conflicting = names.filter(n => PROVIDED_VARS.has(n.split(/[\s:]/)[0].trim()));
+
+      if (conflicting.length > 0) {
+        const remaining = names.filter(n => !PROVIDED_VARS.has(n.split(/[\s:]/)[0].trim()));
+        if (remaining.length === 0) {
+          // ALL names are provided vars — remove entire line
+          console.warn(`[sanitizeSimulationCode] Removed redeclaration: ${trimmed.substring(0, 80)}`);
+          devLogger.logAutoFix('strip-redeclaration', `Removed: ${trimmed.substring(0, 80)}`);
+          return '';
+        } else {
+          // Partial overlap — keep only non-provided names
+          const newLine = `${keyword}{ ${remaining.join(', ')} }${rhs}`;
+          console.warn(`[sanitizeSimulationCode] Stripped provided vars from destructuring: ${conflicting.join(', ')}`);
+          devLogger.logAutoFix('strip-partial-redecl', `Removed ${conflicting.join(', ')} from destructuring`);
+          return newLine;
+        }
+      }
+    }
+
+    // Handle direct variable redeclarations: const useFrame = ..., let THREE = ..., var React = ...
+    const directDeclMatch = trimmed.match(/^(?:const|let|var)\s+(\w+)\s*=/);
+    if (directDeclMatch && PROVIDED_VARS.has(directDeclMatch[1])) {
+      console.warn(`[sanitizeSimulationCode] Removed direct redeclaration: ${trimmed.substring(0, 80)}`);
+      devLogger.logAutoFix('strip-direct-redecl', `Removed: ${trimmed.substring(0, 80)}`);
+      return '';
+    }
+
+    return line;
+  }).join('\n');
+
   // --- Hoist hooks out of conditional blocks (if/for/while) to prevent ---
   // "Rendered more hooks than during the previous render" crashes.
   sanitized = hoistConditionalHooks(sanitized);
@@ -278,28 +490,26 @@ function sanitizeSimulationCode(code: string): string {
   }
 
   // --- Fix geometry constructors (skip BufferGeometry / Float32BufferAttribute) ---
-  // Also skip replacement when geometry is stored in a variable and has methods called
-  // on it later (e.g., geo.rotateX(), geo.translate(), geo.setAttribute() etc.)
-  // because React.createElement returns a React element, NOT a Three.js geometry instance.
-  const GEOMETRY_INSTANCE_METHODS = [
-    'rotateX', 'rotateY', 'rotateZ', 'translate', 'scale', 'lookAt',
-    'setAttribute', 'setIndex', 'setFromPoints', 'computeVertexNormals',
-    'computeBoundingSphere', 'computeBoundingBox', 'center', 'normalize',
-    'applyMatrix4', 'merge', 'dispose', 'clone', 'copy',
-    'attributes', 'index',
-  ];
+  // Only convert `new THREE.XxxGeometry(...)` → `React.createElement(...)` when it
+  // appears directly inline (e.g. as a child argument to createElement).
+  //
+  // If the geometry is being *stored* (variable assignment, arrow return, explicit
+  // return, imperative .geometry assignment), leave it alone — converting would
+  // produce a frozen React element instead of a real THREE.BufferGeometry, breaking
+  // instancedMesh args, <primitive object={}>, .dispose(), etc.
+  //
+  // ThreeSandbox's runtime safeCreateElement auto-fix handles the remaining case
+  // where an unconverted geometry instance is passed as a React child.
 
   for (const geo of R3F_GEOMETRY_TYPES) {
     const elementName = geo.charAt(0).toLowerCase() + geo.slice(1);
-    // Match:  new THREE.BoxGeometry(  ...args...  )
-    // Uses a balanced-paren counter to handle nested parens in args.
     const prefix = `new THREE.${geo}(`;
     let startIdx = 0;
     while (true) {
       const idx = sanitized.indexOf(prefix, startIdx);
       if (idx === -1) break;
 
-      // Find the matching closing paren
+      // Find the matching closing paren (balanced-paren counter)
       const argsStart = idx + prefix.length;
       let depth = 1;
       let i = argsStart;
@@ -308,29 +518,18 @@ function sanitizeSimulationCode(code: string): string {
         else if (sanitized[i] === ')') depth--;
         i++;
       }
-      const argsEnd = i - 1; // index of the closing paren
+      const argsEnd = i - 1;
       const argsStr = sanitized.substring(argsStart, argsEnd).trim();
 
-      // Check if this geometry instance is stored in a variable that later has
-      // geometry methods called on it (e.g., `const geo = new THREE.PlaneGeometry(...); geo.rotateX(...)`)
-      // If so, it MUST remain as a THREE constructor — React.createElement returns a React element, not a geometry.
-      let skipReplacement = false;
+      // Check the code immediately before `new THREE.XxxGeometry(` to decide
+      // whether this geometry is being stored/returned (skip) or used inline (convert).
       const lookBack = sanitized.substring(Math.max(0, idx - 80), idx);
-      const varMatch = lookBack.match(/(?:const|let|var)\s+(\w+)\s*=\s*$/);
-      if (varMatch) {
-        const varName = varMatch[1];
-        const codeAfter = sanitized.substring(argsEnd + 1);
-        // Check if the variable has geometry-instance methods or property access called on it
-        for (const method of GEOMETRY_INSTANCE_METHODS) {
-          if (codeAfter.includes(`${varName}.${method}`)) {
-            skipReplacement = true;
-            break;
-          }
-        }
-      }
+      const isAssignment = /=\s*$/.test(lookBack);       // const x = ..., .geometry = ...
+      const isArrowReturn = /=>\s*$/.test(lookBack);     // () => new THREE...
+      const isExplicitReturn = /return\s+$/.test(lookBack); // return new THREE...
 
-      if (skipReplacement) {
-        console.log(`[sanitizeSimulationCode] Skipped: new THREE.${geo}(...) — variable has geometry methods called on it`);
+      if (isAssignment || isArrowReturn || isExplicitReturn) {
+        console.log(`[sanitizeSimulationCode] Skipped: new THREE.${geo}(...) — stored/returned, not inline`);
         startIdx = argsEnd + 1;
         continue;
       }
@@ -352,6 +551,13 @@ function sanitizeSimulationCode(code: string): string {
   // --- Fix React.createElement('xxxGeometry', ...) with method calls ---
   // AI sometimes writes: const geo = React.createElement('planeGeometry', { args: [...] }); geo.rotateX(...)
   // React.createElement returns a React element, NOT a geometry. Convert back to THREE constructor.
+  const GEOMETRY_INSTANCE_METHODS = [
+    'rotateX', 'rotateY', 'rotateZ', 'translate', 'scale', 'lookAt',
+    'setAttribute', 'setIndex', 'setFromPoints', 'computeVertexNormals',
+    'computeBoundingSphere', 'computeBoundingBox', 'center', 'normalize',
+    'applyMatrix4', 'merge', 'dispose', 'clone', 'copy',
+    'attributes', 'index',
+  ];
   for (const geo of R3F_GEOMETRY_TYPES) {
     const elementName = geo.charAt(0).toLowerCase() + geo.slice(1);
     const cePattern = `React.createElement('${elementName}'`;
@@ -453,7 +659,7 @@ function sanitizeSimulationCode(code: string): string {
   const multiObjAntiPattern = /(\w+Ref\.current(?:\.\w+)*)\.(?:map|forEach)\([^)]*=>\s*React\.createElement\(['"]mesh['"],\s*\{[^}]*position:\s*\[[^\]]*\1\[.*?\]\.(?:pos|position)/;
   if (multiObjAntiPattern.test(sanitized)) {
     console.warn('[sanitizeSimulationCode] ⚠️  ANIMATION BUG DETECTED: Multi-object animation using position prop from ref array. This causes laggy/glitchy animation. Use pre-allocated mesh refs and update mesh.position in useFrame instead. See section 7b of the prompt.');
-    devLogger.log('warn', 'Sanitizer', 'Multi-object animation anti-pattern detected: position prop from ref array will not animate smoothly');
+    devLogger.addEntry('warn', 'Sanitizer', 'Multi-object animation anti-pattern detected: position prop from ref array will not animate smoothly');
   }
 
   // --- Fix material constructors ---
@@ -567,16 +773,74 @@ async function callGemini(
 // Unified API Call Function
 // ============================================================================
 
+// ============================================================================
+// Session-Level API Budget (Circuit Breaker)
+// ============================================================================
+// Hard cap on error-correction LLM calls per browser session.  Prevents any
+// runaway retry loop — regardless of cause — from burning thousands of API
+// calls and tokens.  Normal content generation (slides, quiz, sim gen, chat)
+// is NOT counted; only error-fix / retry paths increment the budget.
+// ============================================================================
+const ERROR_CORRECTION_BUDGET = {
+  /** Max error-correction calls allowed per session (set dynamically to section count) */
+  maxCalls: 5,
+  /** Calls consumed so far in this session */
+  callsUsed: 0,
+  /** Per-section caps: sectionId → calls used */
+  perSection: new Map<number, number>(),
+  /** Max error-correction calls per individual section — 1 means one shot per section */
+  maxPerSection: 1,
+};
+
+/**
+ * Set the session budget to match the number of sections in the course.
+ * Called once after syllabus generation so that maxCalls = sectionCount
+ * (i.e., at most 1 error-correction call per section across the session).
+ */
+export function initErrorCorrectionBudget(sectionCount: number): void {
+  ERROR_CORRECTION_BUDGET.maxCalls = sectionCount;
+  ERROR_CORRECTION_BUDGET.callsUsed = 0;
+  ERROR_CORRECTION_BUDGET.perSection.clear();
+  console.log(`[BUDGET] Initialized: ${sectionCount} sections → max ${sectionCount} error-correction calls (1 per section)`);
+}
+
+/**
+ * Check whether an error-correction call is allowed.  If over budget, throws
+ * so the caller's catch block can handle it gracefully.
+ */
+export function consumeErrorCorrectionBudget(sectionId?: number): void {
+  if (sectionId !== undefined) {
+    const prev = ERROR_CORRECTION_BUDGET.perSection.get(sectionId) ?? 0;
+    if (prev >= ERROR_CORRECTION_BUDGET.maxPerSection) {
+      const msg = `[BUDGET] Section ${sectionId}: already used ${prev}/${ERROR_CORRECTION_BUDGET.maxPerSection} error-correction call(s). Giving up on this section.`;
+      console.warn(msg);
+      devLogger.addEntry('warn', 'Budget', msg);
+      throw new Error(msg);
+    }
+    ERROR_CORRECTION_BUDGET.perSection.set(sectionId, prev + 1);
+  }
+
+  ERROR_CORRECTION_BUDGET.callsUsed++;
+  if (ERROR_CORRECTION_BUDGET.callsUsed > ERROR_CORRECTION_BUDGET.maxCalls) {
+    const msg = `[BUDGET] Session limit reached (${ERROR_CORRECTION_BUDGET.callsUsed}/${ERROR_CORRECTION_BUDGET.maxCalls}). No more retries this session.`;
+    console.warn(msg);
+    devLogger.addEntry('warn', 'Budget', msg);
+    throw new Error(msg);
+  }
+
+  console.log(`[BUDGET] Error-correction call ${ERROR_CORRECTION_BUDGET.callsUsed}/${ERROR_CORRECTION_BUDGET.maxCalls} (section ${sectionId ?? '?'})`);
+}
+
 async function callLLM(
-  messages: Array<{role: string, content: string}>, 
-  schema: any, 
-  schemaName: string, 
+  messages: Array<{role: string, content: string}>,
+  schema: any,
+  schemaName: string,
   modelTier: ModelTier = 'fast'
 ) {
   const model = getModel(modelTier);
-  
+
   console.log(`[LLM] Using Gemini with model ${model}`);
-  
+
   return callGemini(messages, schema, schemaName, model);
 }
 
@@ -2145,19 +2409,33 @@ Generate the React Three Fiber code body (using React.createElement) and the con
 Use 'toggle' for play/pause or show/hide states. Use 'button' for reset/trigger actions. Use 'slider' for continuous values.
 
 **CRASH PREVENTION RULES:**
-1. MESH elements: geometry+material as CHILDREN via React.createElement, never as constructor instances or props.
-   React.createElement('mesh', null, React.createElement('sphereGeometry', {args:[1,32,32]}), React.createElement('meshStandardMaterial', {color:'#4a9eff', emissive:'#1a3a77', emissiveIntensity:0.4}))
-2. LINE/POINTS elements: geometry IS passed as a prop (BufferGeometry instance is the only exception).
+1. MESH elements: geometry+material as CHILDREN via React.createElement, NEVER as props or constructor instances.
+   ✓ CORRECT: React.createElement('mesh', null, React.createElement('sphereGeometry', {args:[1,32,32]}), React.createElement('meshStandardMaterial', {color:'#4a9eff'}))
+   ✗ WRONG: React.createElement('mesh', {geometry: someGeo}, React.createElement('meshStandardMaterial', {color:'#4a9eff'}))
+   
+1b. NEVER cache React.createElement geometry elements in useMemo/variables and then use them with 'primitive' or as 'geometry' props:
+   ✗ WRONG: \`const geo = React.useMemo(() => React.createElement('sphereGeometry', {args:[1,32,32]}), []); React.createElement('mesh', {geometry: geo}, ...)\`
+   ✗ WRONG: \`const geo = React.useMemo(() => React.createElement('torusGeometry', {...}), []); React.createElement('primitive', {object: geo})\`
+   ✓ CORRECT (for mesh): Put geometry createElement directly as child, don't cache it
+   ✓ CORRECT (for reusable THREE objects): Cache the actual THREE.js instance: \`const geo = React.useMemo(() => new THREE.IcosahedronGeometry(1, 0), []);\` then use as mesh child or with primitive
+
+2. LINE/POINTS/LINELOOP elements: geometry IS passed as a prop, but ONLY when it's a BufferGeometry instance (not a React element).
+   ✓ CORRECT: \`const lineGeo = React.useMemo(() => new THREE.BufferGeometry(), []); React.createElement('line', {geometry: lineGeo}, ...)\`
+   ✗ WRONG: \`const lineGeo = React.useMemo(() => React.createElement('bufferGeometry'), []); React.createElement('line', {geometry: lineGeo}, ...)\`
 3. BufferGeometry always in React.useMemo to prevent recreation every render.
 4. Allowed THREE constructors: BufferGeometry, PlaneGeometry (for procedural grids), SphereGeometry (for procedural), LatheGeometry (for surfaces of revolution), Float32BufferAttribute, BufferAttribute, Vector3, Vector2, Color, Euler, Matrix4, MathUtils. ANY geometry constructor is OK when stored in a useMemo for procedural use. NEVER use new THREE.XxxMaterial(...).
 5. setFromPoints() ONLY on BufferGeometry: ref.current.geometry.setFromPoints(pts), NOT ref.current.setFromPoints(pts).
 6. NEVER call .computeBoundingSphere() — the runtime handles frustum culling automatically. Calling it on the wrong object (e.g. a BufferAttribute instead of BufferGeometry) causes "is not a function" crashes.
+6b. CUSTOM CLASSES (e.g., extending THREE.Curve): NEVER define class declarations inside React.useMemo/useEffect callbacks. Classes must be defined at the TOP LEVEL of your code, outside all hooks. 
+   WRONG: \`const geo = React.useMemo(() => { class MyCurve extends THREE.Curve {...}; return new THREE.TubeGeometry(new MyCurve(), ...); }, []);\`
+   CORRECT: Define class at top: \`class MyCurve extends THREE.Curve {...}\` then use it in useMemo: \`const geo = React.useMemo(() => new THREE.TubeGeometry(new MyCurve(), ...), []);\`
 7. HOOKS MUST BE UNCONDITIONAL: NEVER place React.useMemo, React.useEffect, React.useRef, or React.useState inside if/else, for, while, or any conditional block. ALL hook calls must be at the top level of your code. Only the RESULTS of hooks can be used inside conditionals. Example: define \`const geo = React.useMemo(...)\` at the top, then use \`if (condition) { children.push(element_using_geo) }\` below.
 8. ALLOWED ELEMENT NAMES ONLY: 'group', 'mesh', 'line', 'lineSegments', 'points', 'instancedMesh', 'ambientLight', 'directionalLight', 'pointLight', 'spotLight', 'hemisphereLight', 'Text', 'PerspectiveCamera', 'OrthographicCamera', 'OrbitControls', 'GridHelper', 'AxesHelper'. Do NOT invent helper elements like 'Translate', 'Rotate', 'Scale', 'Animate', or 'GlowMesh'. To move/rotate/scale things, always wrap them in a 'group' and use position/rotation/scale props on that group.
 9. FINAL SELF-CHECK:
    a. Search for "new THREE." — any XxxMaterial constructor = CRASH. Replace with React.createElement. Geometry constructors are OK if stored in useMemo for procedural use.
    b. Verify EVERY React.useRef/useMemo/useEffect/useState is at the outermost indentation level of your code — NOT inside any if/for/while block.
-   c. If you have MULTIPLE moving objects (rockets, particles from a launch button, etc): Did you pre-allocate mesh refs and update mesh.position in useFrame? Or did you wrongly use \`position: [stateRef.current.x, y, z]\` in the return statement? The latter only evaluates once and causes laggy animation. See section 7b above for the correct pattern.`
+   c. If you have MULTIPLE moving objects (rockets, particles from a launch button, etc): Did you pre-allocate mesh refs and update mesh.position in useFrame? Or did you wrongly use \`position: [stateRef.current.x, y, z]\` in the return statement? The latter only evaluates once and causes laggy animation. See section 7b above for the correct pattern.
+   d. NO DUPLICATE VARIABLE DECLARATIONS: Search for duplicate \`const\` declarations of the same variable name (e.g., two \`const meshRef\` at top level). If you define helper functions/components that need their own refs, declare those refs INSIDE the function, not at the top level. Each variable name can only be declared once in the same scope.`
     }
   ];
 
@@ -2173,206 +2451,334 @@ Use 'toggle' for play/pause or show/hide states. Use 'button' for reset/trigger 
   };
 };
 
-// 3b. Generate Interactive 3D Code with Error Correction (Retry attempt)
-export const generateInteractiveCodeErrorCorrection = async (
-  topic: string,
-  sectionTitle: string,
-  simulationDescription: string,
-  previousContext: string,
-  currentSlidesContext: string,
-  sectionNumber: number,
-  level: LearningLevel,
-  previousCode: string,
-  errorMessage: string,
-  errorStack?: string
-): Promise<InteractiveConfig> => {
-  const schema = {
-    type: "object",
-    properties: {
-      params: {
-        type: "array",
-        items: {
-          type: "object",
-          properties: {
-            name: { type: "string", description: "Variable name used in code (camelCase)" },
-            label: { type: "string", description: "Human readable label" },
-            controlType: { type: "string", enum: ['slider', 'toggle', 'button'] },
-            min: { type: "number", description: "Minimum value for slider (use 0 for toggle/button)" },
-            max: { type: "number", description: "Maximum value for slider (use 1 for toggle/button)" },
-            step: { type: "number", description: "Step size for slider (use 1 for toggle/button)" },
-            defaultValue: { type: "number", description: "For toggle: 1=true, 0=false. For button: 0." },
-          },
-          required: ["name", "label", "controlType", "min", "max", "step", "defaultValue"],
-          additionalProperties: false,
+// 3d. Edit Simulation Code via search-and-replace (uses Flash, saves tokens)
+
+// Shared schema for patch-based simulation responses (edit + error fix)
+const PARAMS_ITEM_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    name: { type: "string" },
+    label: { type: "string" },
+    controlType: { type: "string", enum: ['slider', 'toggle', 'button'] },
+    min: { type: "number" },
+    max: { type: "number" },
+    step: { type: "number" },
+    defaultValue: { type: "number" }
+  },
+  required: ["name", "label", "controlType", "min", "max", "step", "defaultValue"],
+  additionalProperties: false
+};
+
+const SIMULATION_PATCH_RESPONSE_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    explanation: { type: "string", description: "Brief explanation of changes made" },
+    edits: {
+      type: "array" as const,
+      description: "Array of search-and-replace operations. old_code must appear EXACTLY in the current code.",
+      items: {
+        type: "object" as const,
+        properties: {
+          old_code: { type: "string", description: "Exact substring to find and replace" },
+          new_code: { type: "string", description: "Replacement string" }
         },
-      },
-      code: {
-        type: "string",
-        description: "The function body of a React Functional Component using @react-three/fiber. Do NOT include imports. Do NOT return the component, just the body."
+        required: ["old_code", "new_code"],
+        additionalProperties: false
       }
     },
-    required: ["params", "code"],
-    additionalProperties: false,
-  };
+    params: {
+      type: "array" as const,
+      description: "Full updated params array. Unchanged if no control changes.",
+      items: PARAMS_ITEM_SCHEMA
+    }
+  },
+  required: ["explanation", "edits", "params"],
+  additionalProperties: false
+};
 
-  const levelInstructions = getLevelInstructions(level);
+function truncForEdit(s: string, maxLen = 80): string {
+  return s.length > maxLen ? s.slice(0, maxLen) + '...' : s;
+}
 
-  const errorAnalysis = `
-=== ERROR CORRECTION MODE ===
-Your previous code generation resulted in a RUNTIME ERROR. Please carefully analyze and fix it.
+function buildFailedEditsRetryPrompt(
+  currentCode: string,
+  failedEdits: SimulationEdit[],
+  contextLine: string
+): string {
+  const failedList = failedEdits.map((e, i) => `[${i + 1}] old_code: "${truncForEdit(e.old_code)}"`).join('\n');
+  return `These edits failed because old_code was not found in the code:
+${failedList}
 
-PREVIOUS CODE THAT FAILED:
+Here is the current code again. Provide corrected edits with old_code that exactly matches substrings in this code:
 \`\`\`javascript
-${previousCode}
+${currentCode}
 \`\`\`
+
+${contextLine}`;
+}
+
+/**
+ * Builds the conversational history string used when editing simulations.
+ *
+ * Token usage safeguards:
+ * - Only successful, non-pending edits are included.
+ * - Only the last 10 such edits are used.
+ * - Each user request and explanation is truncated to a bounded length.
+ */
+function buildSimEditHistoryContext(
+  editHistory?: SimEditHistoryItem[]
+): string {
+  if (!editHistory || editHistory.length === 0) {
+    return '';
+  }
+
+  const previousEdits = editHistory
+    .filter(item => !item.pending && item.success)
+    .slice(-10) // Limit to last 10 edits to manage token cost
+    .map((item, index) => {
+      const userText = truncForEdit(item.userRequest, 300);
+      const explanationText = truncForEdit(item.explanation, 600);
+
+      return `Previous Edit ${index + 1}:
+User: ${userText}
+Assistant: ${explanationText}`;
+    })
+    .join('\n\n');
+
+  if (!previousEdits) {
+    return '';
+  }
+
+  return `
+
+PREVIOUS EDIT HISTORY (for context):
+${previousEdits}
+
+---`;
+}
+
+function applySimulationEdits(
+  code: string,
+  edits: SimulationEdit[]
+): { newCode: string; failedEdits: SimulationEdit[] } {
+  let currentCode = code;
+  const failedEdits: SimulationEdit[] = [];
+
+  for (const edit of edits) {
+    const { old_code, new_code } = edit;
+    if (!currentCode.includes(old_code)) {
+      failedEdits.push(edit);
+      continue;
+    }
+    // Use replaceAll to fix ALL occurrences (critical for repeated error patterns)
+    currentCode = currentCode.replaceAll(old_code, new_code);
+  }
+
+  return { newCode: currentCode, failedEdits };
+}
+
+export const editSimulationCode = async (
+  currentCode: string,
+  currentParams: ControlParam[],
+  userRequest: string,
+  editHistory?: SimEditHistoryItem[]
+): Promise<InteractiveConfig & { explanation: string }> => {
+  const schema = SIMULATION_PATCH_RESPONSE_SCHEMA;
+
+  const systemPrompt = `You are a code editor for React Three Fiber simulations. The user will request changes to an existing simulation.
+
+Your tool is search-and-replace. You MUST output edits as an array of {old_code, new_code} pairs.
+- old_code: An EXACT substring that appears in the current code (copy it precisely, including whitespace)
+- new_code: The replacement string
+
+RULES:
+1. NEVER output the full code. Only output the minimal edits needed.
+2. Match exact substrings — old_code must exist verbatim in the code.
+3. If adding a new slider/toggle/button, update the params array. Use the same structure as existing params.
+4. Keep edits minimal and precise. One edit per logical change.
+5. For geometry changes (e.g. "make balls bigger"), find the geometry args and change the numeric values.
+6. For new controls, add to params AND add code that reads params.<name> in the simulation.
+7. If previous edit history is provided, use it for context to understand the sequence of changes and avoid conflicts.`;
+
+  const paramsJson = JSON.stringify(currentParams, null, 2);
+  const historyContext = buildSimEditHistoryContext(editHistory);
+
+  const userPrompt = `Current simulation code:
+\`\`\`javascript
+${currentCode}
+\`\`\`
+
+Current controls (params):
+${paramsJson}${historyContext}
+
+User request: ${userRequest}
+
+Output your edits. Remember: old_code must be an EXACT substring from the code above.`;
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt }
+  ];
+
+  let result: SimulationEditResult = await callLLM(messages, schema, "simulation_edit_schema", "fast");
+  const edits = Array.isArray(result.edits) ? result.edits : [];
+  let { newCode, failedEdits } = applySimulationEdits(currentCode, edits);
+
+  if (failedEdits.length > 0) {
+    const retryPrompt = buildFailedEditsRetryPrompt(currentCode, failedEdits, `Original user request: ${userRequest}`);
+    // Include conversation history in retry messages too
+    const retryMessages = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+      { role: "user", content: retryPrompt }
+    ];
+    const retryResult: SimulationEditResult = await callLLM(
+      retryMessages,
+      schema, "simulation_edit_retry_schema", "fast"
+    );
+    const retryEdits = Array.isArray(retryResult.edits) ? retryResult.edits : [];
+    const retryApply = applySimulationEdits(currentCode, retryEdits);
+    if (retryApply.failedEdits.length > 0) {
+      throw new Error(
+        `Could not apply edits. These old_code strings were not found: ${retryApply.failedEdits.map(e => JSON.stringify(e.old_code)).join(', ')}`
+      );
+    }
+    newCode = retryApply.newCode;
+    result = retryResult;
+  }
+
+  const cleanCode = sanitizeSimulationCode(newCode);
+  const safeParams = Array.isArray(result.params) ? result.params : currentParams;
+  return {
+    prompt: "User edit: " + userRequest,
+    code: cleanCode,
+    params: safeParams,
+    explanation: result.explanation
+  };
+};
+
+// 3e. Fix Simulation Code via Patch (Error Correction with Flash model)
+export const fixSimulationCodeWithPatch = async (
+  currentCode: string,
+  currentParams: ControlParam[],
+  errorMessage: string,
+  errorStack?: string,
+  validationWarnings?: string[],
+  sectionId?: number
+): Promise<InteractiveConfig & { explanation: string }> => {
+  // Budget check — throws if over session or per-section limit
+  consumeErrorCorrectionBudget(sectionId);
+
+  const schema = SIMULATION_PATCH_RESPONSE_SCHEMA;
+
+  const systemPrompt = `You are a code editor for React Three Fiber simulations specializing in ERROR CORRECTION.
+
+A runtime error occurred in the simulation code. Your task is to produce MINIMAL search-and-replace patches to fix it.
+
+Your tool is search-and-replace. You MUST output edits as an array of {old_code, new_code} pairs.
+- old_code: An EXACT substring that appears in the current code (copy it precisely, including whitespace)
+- new_code: The replacement string that fixes the error
+
+CRITICAL RULES:
+1. NEVER output the full code. Only output the MINIMAL edits needed to fix the error.
+2. Match exact substrings — old_code must exist verbatim in the code.
+3. Analyze the error message and identify which of the common patterns below caused it.
+4. Keep edits surgical and precise. Only change what's broken.
+5. If the fix requires param changes (rare), update the params array.
+
+${R3F_ERROR_PATTERNS}
+
+ADDITIONAL RULES:
+- Identify the specific error pattern from the list above
+- Locate the problematic code section
+- Create minimal edits that fix ONLY the error
+- Preserve all working functionality
+- Do NOT refactor or improve code that isn't broken`;
+
+  const paramsJson = JSON.stringify(currentParams, null, 2);
+
+  const validationWarningsText = validationWarnings && validationWarnings.length > 0
+    ? `\n\nPRE-EXECUTION VALIDATION WARNINGS (Static Analysis):
+${validationWarnings.map((w, i) => `${i + 1}. ${w}`).join('\n')}
+
+NOTE: These warnings were detected BEFORE execution. The runtime error likely stems from one of these issues.`
+    : '';
+
+  const userPrompt = `Current simulation code that produced an error:
+\`\`\`javascript
+${currentCode}
+\`\`\`
+
+Current controls (params):
+${paramsJson}
 
 RUNTIME ERROR:
 ${errorMessage}
 
-${errorStack ? `ERROR STACK TRACE:\n${errorStack.substring(0, 500)}` : ''}
+${errorStack ? `ERROR STACK TRACE:\n${errorStack.substring(0, 500)}` : ''}${validationWarningsText}
 
-COMMON ERROR PATTERNS AND FIXES:
-
-1. **"LineDashMaterial is not part of the THREE namespace"**
-   - WRONG: React.createElement('lineDashMaterial', ...)
-   - CORRECT: Use 'lineBasicMaterial' or 'lineDashedMaterial' (these exist in THREE.js)
-
-2. **"e.getIndex is not a function"** or **geometry errors**
-   - WRONG: Passing a standard geometry to 'line' or 'points' elements incorrectly
-   - CORRECT: For lines, create BufferGeometry via React.useMemo:
-     \`\`\`
-     const lineGeo = React.useMemo(() => {
-       const geo = new THREE.BufferGeometry();
-       geo.setFromPoints([new THREE.Vector3(0,0,0), new THREE.Vector3(1,0,0)]);
-       return geo;
-     }, []);
-     React.createElement('line', { geometry: lineGeo }, React.createElement('lineBasicMaterial', { color: '#fff' }))
-     \`\`\`
-
-3. **"e.remove is not a function"** or **removeFromParent errors**
-   - WRONG: Calling methods on wrong object types or trying to remove incompatible objects
-   - CORRECT: Ensure you're working with proper THREE.js Object3D instances
-
-4. **"Objects are not valid as a React child"**
-   - WRONG: React.createElement('mesh', null, new THREE.BoxGeometry(1,1,1))
-   - CORRECT: React.createElement('mesh', null, React.createElement('boxGeometry', { args: [1,1,1] }))
-
-5. **"Cannot convert undefined or null to object"**
-   - WRONG: Accessing properties on undefined objects or refs not yet initialized
-   - CORRECT: Add null checks: if (ref.current) { ... }
-
-6. **"Cannot read properties of undefined (reading 'center')" / boundingSphere errors**
-   - The runtime automatically sets frustumCulled=false on all 3D elements, so this should not occur
-   - Do NOT call .computeBoundingSphere() anywhere — the runtime handles frustum culling
-   - If you see this error, just remove any .computeBoundingSphere() calls from the code
-
-7. **"attr.computeBoundingSphere is not a function"**
-   - WRONG: Calling .computeBoundingSphere() on a BufferAttribute (e.g. geometry.attributes.position)
-   - WRONG: \`const attr = ref.current.geometry.attributes.position; attr.computeBoundingSphere();\`
-   - CORRECT: Simply remove all .computeBoundingSphere() calls. The runtime handles this automatically via frustumCulled=false.
-   - BufferAttribute does NOT have a computeBoundingSphere method — only BufferGeometry does.
-   - This error fires every frame inside useFrame, causing thousands of console errors.
-
-8. **"geometry.addEventListener is not a function"**
-   - This happens when a React element is passed as the \`geometry\` prop on a mesh instead of a THREE.BufferGeometry instance.
-   - WRONG: Caching a React element in useMemo, then using it as geometry prop:
-     \`\`\`
-     const sphereGeo = React.useMemo(() => React.createElement('sphereGeometry', { args: [1, 32, 32] }), []);
-     React.createElement('mesh', { geometry: sphereGeo }, ...) // CRASH!
-     \`\`\`
-   - CORRECT: Put geometry as a CHILD element, never as a prop:
-     \`\`\`
-     React.createElement('mesh', null,
-       React.createElement('sphereGeometry', { args: [1, 32, 32] }),
-       React.createElement('meshStandardMaterial', { color: '#4a9eff' })
-     )
-     \`\`\`
-   - REMEMBER: For mesh elements, geometry and material are ALWAYS children, NEVER props.
-   - The ONLY element type that accepts a geometry prop is 'line', 'lineSegments', and 'points' (with a real BufferGeometry instance).
-
-9. **"Rendered more hooks than during the previous render"** or **"Cannot read properties of undefined (reading 'length')"**
-   - CAUSE: React hooks (useMemo, useRef, useEffect, useState) called INSIDE if/else, for/while blocks
-   - React requires hooks to be called in the EXACT SAME ORDER every render. Conditional hooks break this rule.
-   - WRONG:
-     \`\`\`
-     if (isBlackHole) {
-       const geo = React.useMemo(() => { ... }, [dep]); // FATAL - hook inside if!
-       children.push(React.createElement('line', { geometry: geo }));
-     }
-     \`\`\`
-   - CORRECT:
-     \`\`\`
-     const geo = React.useMemo(() => { ... }, [dep]); // Hook at top level - ALWAYS runs
-     if (isBlackHole) {
-       children.push(React.createElement('line', { geometry: geo })); // Only render conditionally
-     }
-     \`\`\`
-   - FIX: Move ALL React.useRef, React.useMemo, React.useEffect, React.useState calls to the TOP LEVEL of the code, before any if/for/while blocks. The results can then be used conditionally.
-
-CRITICAL INSTRUCTIONS FOR RETRY:
-- Analyze the error message carefully
-- Identify which of the common patterns above caused the error
-- Rewrite the code avoiding that specific pattern
-- Double-check all React.createElement calls for correct R3F syntax
-- Ensure all geometries and materials are React elements, NOT THREE.js instances
-- Test your logic mentally before finalizing
-`;
-
-  const systemPrompt = `
-You are an expert React Three Fiber developer in ERROR CORRECTION MODE.
-
-${errorAnalysis}
-
-${levelInstructions}
-
-Your task is to fix the previous code that caused a runtime error.
-Follow the same requirements as before but AVOID the error pattern identified above.
-
-CRITICAL RULES (same as before):
-1. **NO IMPORTS OR DECLARATIONS**: React, THREE, useFrame, useThree, Text, params are already available
-2. **React Elements ONLY**: Use React.createElement for all R3F elements
-3. **No JSX**: Environment does not support JSX
-4. **ALLOWED GEOMETRIES**: boxGeometry, sphereGeometry, cylinderGeometry, coneGeometry, planeGeometry, torusGeometry, circleGeometry, tubeGeometry, ringGeometry, torusKnotGeometry
-5. **For LINES**: Use BufferGeometry created in React.useMemo
-6. **For MESH elements**: Geometry and material must be CHILDREN (React elements), never props or instances
-7. **HOOKS MUST BE UNCONDITIONAL**: ALL React.useRef, React.useMemo, React.useEffect, React.useState calls MUST be at the TOP LEVEL of the code — NEVER inside if/else, for, while, or any conditional block. Only the RESULTS of hooks can be used conditionally.
-
-Return the CORRECTED code that fixes the error.
-`;
+Analyze the error, identify which common pattern above caused it, and output minimal patches to fix it. Remember: old_code must be an EXACT substring from the code above.`;
 
   const messages = [
-    {
-      role: "system",
-      content: systemPrompt
-    },
-    {
-      role: "user",
-      content: `Topic: ${topic}. Section ${sectionNumber}: ${sectionTitle}.
-Simulation Request: ${simulationDescription}.
-
-This is a RETRY attempt. Your previous code failed with the error shown above.
-
-Generate CORRECTED React Three Fiber code that:
-1. Fixes the specific error that occurred
-2. Maintains the same educational purpose and interactivity
-3. Uses correct R3F patterns throughout
-4. Avoids all common error patterns listed above
-
-Double-check your code before responding.`
-    }
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt }
   ];
 
-  const result = await callLLM(messages, schema, "interactive_code_error_correction_schema", "capable");
-  
-  // Sanitize the corrected code
-  const cleanCode = sanitizeSimulationCode(result.code);
+  let result: SimulationEditResult = await callLLM(messages, schema, "simulation_error_fix_schema", "fast");
+  const edits = Array.isArray(result.edits) ? result.edits : [];
+  let { newCode, failedEdits } = applySimulationEdits(currentCode, edits);
 
-  console.log('[ERROR CORRECTION] Generated corrected code');
+  // Retry if any edits failed to apply
+  if (failedEdits.length > 0) {
+    const retryPrompt = buildFailedEditsRetryPrompt(currentCode, failedEdits, `Original error: ${errorMessage}`);
+    const retryResult: SimulationEditResult = await callLLM(
+      [{ role: "system", content: systemPrompt }, { role: "user", content: userPrompt }, { role: "user", content: retryPrompt }],
+      schema, "simulation_error_fix_retry_schema", "fast"
+    );
+    const retryEdits = Array.isArray(retryResult.edits) ? retryResult.edits : [];
+    const retryApply = applySimulationEdits(currentCode, retryEdits);
+    if (retryApply.failedEdits.length > 0) {
+      throw new Error(
+        `Could not apply error fixes. These old_code strings were not found: ${retryApply.failedEdits.map(e => JSON.stringify(e.old_code)).join(', ')}`
+      );
+    }
+    newCode = retryApply.newCode;
+    result = retryResult;
+  }
+
+  const cleanCode = sanitizeSimulationCode(newCode);
+  const safeParams = Array.isArray(result.params) ? result.params : currentParams;
+
+  // VALIDATE the corrected code before returning
+  const validation = validateSimulationCode(cleanCode);
+
+  // Log warnings
+  if (validation.warnings && validation.warnings.length > 0) {
+    console.warn('[ERROR FIX] Corrected code has warnings:', validation.warnings);
+  }
+
+  if (!validation.valid) {
+    console.warn('[ERROR FIX] Corrected code still has validation errors:', validation.errors);
+
+    // Re-attempt correction with validation errors
+    const validationErrorMsg = validation.errors
+      .map(e => `Line ${e.line}: ${e.message}`)
+      .join('; ');
+
+    throw new Error(
+      `Error correction failed validation: ${validationErrorMsg}. ` +
+      `Original error: ${errorMessage}`
+    );
+  }
+
+  console.log('[ERROR FIX] Corrected code passed validation ✓');
+  console.log('[ERROR FIX] Applied patch-based error correction');
 
   return {
-    prompt: simulationDescription,
+    prompt: "Error fix: " + errorMessage,
     code: cleanCode,
-    params: result.params
+    params: safeParams,
+    explanation: result.explanation
   };
 };
 

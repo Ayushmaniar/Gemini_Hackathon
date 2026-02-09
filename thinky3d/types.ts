@@ -51,6 +51,42 @@ export interface InteractiveConfig {
   params: ControlParam[];
 }
 
+// ============================================================================
+// Simulation Edit Types (for LLM-based code editing)
+// ============================================================================
+
+export interface SimulationEdit {
+  old_code: string;
+  new_code: string;
+}
+
+export interface SimulationEditResult {
+  explanation: string;
+  edits: SimulationEdit[];
+  params: ControlParam[];
+}
+
+// History items shown in the Simulation Edit panel and used
+// as conversational context for patch-based code edits.
+export interface SimEditHistoryItem {
+  /** Original natural-language request from the user. */
+  userRequest: string;
+  /**
+   * Assistant's explanation for what changed.
+   * This is also used as part of the LLM conversation history (truncated)
+   * when building future simulation edit prompts.
+   */
+  explanation: string;
+  /** Whether this edit completed successfully. Failed edits are still kept in UI history. */
+  success: boolean;
+  /**
+   * True while waiting for API response.
+   * Pending items are shown in the UI but explicitly excluded from LLM history
+   * to avoid leaking in-flight edits into the conversation context.
+   */
+  pending?: boolean;
+}
+
 export interface QuizQuestion {
   id: number;
   question: string;
@@ -152,3 +188,21 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
   autoPlay: false,
   volume: 0.8,
 };
+
+// ============================================================================
+// Code Validation Types
+// ============================================================================
+
+export interface ValidationError {
+  type: 'undefined' | 'tdz' | 'syntax';
+  variable: string;
+  line: number;
+  column: number;
+  message: string;
+}
+
+export interface ValidationResult {
+  valid: boolean;
+  errors: ValidationError[];
+  warnings?: string[];
+}
